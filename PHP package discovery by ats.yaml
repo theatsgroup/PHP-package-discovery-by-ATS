@@ -1,0 +1,273 @@
+zabbix_export:
+  version: '7.0'
+  template_groups:
+    - uuid: 846977d1dfed4968bc5f8bdb363285bc
+      name: 'Templates/Operating systems'
+  templates:
+    - uuid: 8e509849e135497495106fa3c2fd6dea
+      template: 'PHP package discovery by ATS'
+      name: 'PHP package discovery by ATS'
+      description: |
+        Discovers installed PHP packages via the Zabbix agent (system.sw.packages.get) and tracks their versions.
+        
+        Includes checks for PHP2Shell (CVE-2026-109618, CVE-2026-109619), the unauthenticated RCE flaws fixed on 2026-10-21 in PHP 8.5.12, 8.4.27, 8.3.36 and 8.2.35. PHP 8.1 and older get no upstream fix.
+        
+        The CVE check compares the upstream version only. Distributions often backport fixes without changing the upstream version, so a vendor-patched package can still raise a problem. Once your vendor confirms a release is patched, add its exact version-release string to {$PHP2SHELL.PATCHED.RELEASES}.
+      vendor:
+        name: ATS
+        version: 7.0-0
+      groups:
+        - name: 'Templates/Operating systems'
+      items:
+        - uuid: 983e1ead4d5848e791a2189ae3e21ada
+          name: 'PHP packages: Get list'
+          key: 'system.sw.packages.get["{$PHP.PKG.MATCHES}"]'
+          delay: '{$PHP.PKG.INTERVAL}'
+          value_type: TEXT
+          trends: '0'
+          description: 'Raw JSON list of installed packages whose name matches {$PHP.PKG.MATCHES}. Master item for PHP package discovery.'
+          tags:
+            - tag: component
+              value: php
+            - tag: component
+              value: raw
+      discovery_rules:
+        - uuid: fdc8ef2fd9844b8f8ad056c583125377
+          name: 'PHP package discovery'
+          type: DEPENDENT
+          key: php.packages.discovery
+          delay: '0'
+          description: 'Discovers every installed package whose name matches {$PHP.PKG.MATCHES} (default: starts with "php").'
+          item_prototypes:
+            - uuid: 2486737e969e48eb961d1c474ccc93af
+              name: 'PHP package {#PKG.NAME} ({#PKG.ARCH}): Version'
+              type: DEPENDENT
+              key: 'php.package.version["{#PKG.NAME}","{#PKG.ARCH}"]'
+              delay: '0'
+              value_type: CHAR
+              trends: '0'
+              description: 'Installed version-release of {#PKG.NAME}.'
+              preprocessing:
+                - type: JSONPATH
+                  parameters:
+                    - '$[?(@.name == ''{#PKG.NAME}'' && @.arch == ''{#PKG.ARCH}'')].version.first()'
+                - type: DISCARD_UNCHANGED_HEARTBEAT
+                  parameters:
+                    - 1d
+              master_item:
+                key: 'system.sw.packages.get["{$PHP.PKG.MATCHES}"]'
+              tags:
+                - tag: component
+                  value: php
+                - tag: package
+                  value: '{#PKG.NAME}'
+              trigger_prototypes:
+                - uuid: f0cdd919c82148528e84ac3e5a92813d
+                  expression: 'change(/PHP package discovery by ATS/php.package.version["{#PKG.NAME}","{#PKG.ARCH}"])=1'
+                  name: 'PHP package {#PKG.NAME} version has changed'
+                  event_name: 'PHP package {#PKG.NAME} ({#PKG.ARCH}) version has changed (new version: {ITEM.VALUE})'
+                  priority: INFO
+                  manual_close: 'YES'
+                  tags:
+                    - tag: scope
+                      value: notice
+          master_item:
+            key: 'system.sw.packages.get["{$PHP.PKG.MATCHES}"]'
+          lld_macro_paths:
+            - lld_macro: '{#PKG.ARCH}'
+              path: $.arch
+            - lld_macro: '{#PKG.NAME}'
+              path: $.name
+        - uuid: 70178af0c7594e0ca1e6f36bce742195
+          name: 'PHP2Shell exposure discovery'
+          type: DEPENDENT
+          key: php.php2shell.discovery
+          delay: '0'
+          filter:
+            conditions:
+              - macro: '{#PKG.NAME}'
+                value: '{$PHP2SHELL.PKG.MATCHES}'
+                formulaid: A
+          description: |
+            Discovers the core PHP package of each installed PHP build (one per branch) and checks it against the PHP2Shell fixes (CVE-2026-109618, CVE-2026-109619).
+            
+            Only packages matching {$PHP2SHELL.PKG.MATCHES} are checked. The default matches the "-common" package, which every distro PHP install has: php-common (RHEL/Fedora), php8.x-common (Debian/Ubuntu), phpXX-php-common (Remi SCL) and phpXX-common (Alpine). PECL extensions, PEAR and PHP libraries have their own version numbers and are not checked.
+          item_prototypes:
+            - uuid: 974085111bb441f18005830af2deda5b
+              name: 'PHP2Shell: {#PKG.NAME} ({#PKG.ARCH}): Exposure status'
+              type: DEPENDENT
+              key: 'php.php2shell.status["{#PKG.NAME}","{#PKG.ARCH}"]'
+              delay: '0'
+              description: |
+                Exposure to CVE-2026-109618 and CVE-2026-109619, based on the installed version:
+                0 - Not affected: at or above the upstream fix for its branch, newer than any affected branch, or listed in {$PHP2SHELL.PATCHED.RELEASES}
+                1 - Vulnerable: supported branch below the upstream fix in {$PHP2SHELL.FIXED.VERSIONS}
+                2 - End-of-life branch (PHP 8.1 or older): no upstream fix, so it's vulnerable unless your vendor has backported one
+                3 - Unknown: the version string could not be parsed
+              valuemap:
+                name: 'PHP2Shell exposure'
+              preprocessing:
+                - type: JAVASCRIPT
+                  parameters:
+                    - |
+                      var v = String(value).trim();
+                      
+                      // Vendor-confirmed patched releases (exact version-release strings).
+                      var patched = '{$PHP2SHELL.PATCHED.RELEASES}'.split(',');
+                      for (var i = 0; i < patched.length; i++) {
+                          var p = patched[i].trim();
+                          if (p !== '' && p === v) {
+                              return 0;
+                          }
+                      }
+                      
+                      // Strip any package epoch ("2:8.3.6-...") and read the upstream x.y.z.
+                      var m = v.replace(/^[0-9]+:/, '').match(/^(\d+)\.(\d+)\.(\d+)/);
+                      if (!m) {
+                          return 3;
+                      }
+                      var branch = parseInt(m[1], 10) * 100 + parseInt(m[2], 10);
+                      var patch = parseInt(m[3], 10);
+                      
+                      // Upstream fixed versions, one per supported branch.
+                      var fixed = '{$PHP2SHELL.FIXED.VERSIONS}'.split(',');
+                      var lowest = null;
+                      var highest = null;
+                      for (var j = 0; j < fixed.length; j++) {
+                          var f = fixed[j].trim().match(/^(\d+)\.(\d+)\.(\d+)$/);
+                          if (!f) {
+                              continue;
+                          }
+                          var fBranch = parseInt(f[1], 10) * 100 + parseInt(f[2], 10);
+                          if (fBranch === branch) {
+                              return patch < parseInt(f[3], 10) ? 1 : 0;
+                          }
+                          if (lowest === null || fBranch < lowest) {
+                              lowest = fBranch;
+                          }
+                          if (highest === null || fBranch > highest) {
+                              highest = fBranch;
+                          }
+                      }
+                      if (lowest === null) {
+                          return 3;
+                      }
+                      if (branch < lowest) {
+                          return 2;
+                      }
+                      // Newer than every affected branch: assumed not affected.
+                      return branch > highest ? 0 : 3;
+                - type: DISCARD_UNCHANGED_HEARTBEAT
+                  parameters:
+                    - 1d
+              master_item:
+                key: 'php.php2shell.version["{#PKG.NAME}","{#PKG.ARCH}"]'
+              tags:
+                - tag: component
+                  value: php
+                - tag: component
+                  value: security
+                - tag: package
+                  value: '{#PKG.NAME}'
+            - uuid: 3ecc6adfd11a48b19aec5c0955b1a7c0
+              name: 'PHP2Shell: {#PKG.NAME} ({#PKG.ARCH}): Installed version'
+              type: DEPENDENT
+              key: 'php.php2shell.version["{#PKG.NAME}","{#PKG.ARCH}"]'
+              delay: '0'
+              value_type: CHAR
+              trends: '0'
+              description: 'Installed version-release of {#PKG.NAME}, used for the PHP2Shell check.'
+              preprocessing:
+                - type: JSONPATH
+                  parameters:
+                    - '$[?(@.name == ''{#PKG.NAME}'' && @.arch == ''{#PKG.ARCH}'')].version.first()'
+                - type: DISCARD_UNCHANGED_HEARTBEAT
+                  parameters:
+                    - 1d
+              master_item:
+                key: 'system.sw.packages.get["{$PHP.PKG.MATCHES}"]'
+              tags:
+                - tag: component
+                  value: php
+                - tag: component
+                  value: security
+                - tag: package
+                  value: '{#PKG.NAME}'
+          trigger_prototypes:
+            - uuid: 907b9ffc23ef402ab16a8119082e45d4
+              expression: 'last(/PHP package discovery by ATS/php.php2shell.status["{#PKG.NAME}","{#PKG.ARCH}"])=2 and length(last(/PHP package discovery by ATS/php.php2shell.version["{#PKG.NAME}","{#PKG.ARCH}"]))>0'
+              name: 'PHP {#PKG.NAME}: End-of-life branch, likely vulnerable to PHP2Shell (CVE-2026-109618, CVE-2026-109619)'
+              event_name: 'PHP {#PKG.NAME} ({#PKG.ARCH}) {ITEM.LASTVALUE2} is an end-of-life branch with no upstream PHP2Shell fix'
+              opdata: 'Installed: {ITEM.LASTVALUE2}'
+              url_name: 'PHP security advisory'
+              url: 'https://www.php.net/archive/2026.php#2026-10-21-5'
+              priority: HIGH
+              description: |
+                PHP 8.1 and older get no upstream fix for PHP2Shell (CVE-2026-109618, CVE-2026-109619). Unless your vendor has backported the fix, this host is vulnerable to unauthenticated remote code execution.
+                
+                Fix: upgrade to a supported PHP branch, or install your vendor's backported package.
+                
+                Once your vendor confirms a backport, add the exact installed version to {$PHP2SHELL.PATCHED.RELEASES} to clear this problem.
+              manual_close: 'YES'
+              tags:
+                - tag: cve
+                  value: CVE-2026-109618
+                - tag: cve
+                  value: CVE-2026-109619
+                - tag: scope
+                  value: security
+            - uuid: 0c50d36c25be4e528c3fbfc738c85f31
+              expression: 'last(/PHP package discovery by ATS/php.php2shell.status["{#PKG.NAME}","{#PKG.ARCH}"])=1 and length(last(/PHP package discovery by ATS/php.php2shell.version["{#PKG.NAME}","{#PKG.ARCH}"]))>0'
+              name: 'PHP {#PKG.NAME}: Vulnerable to PHP2Shell (CVE-2026-109618, CVE-2026-109619)'
+              event_name: 'PHP {#PKG.NAME} ({#PKG.ARCH}) {ITEM.LASTVALUE2} is vulnerable to PHP2Shell (CVE-2026-109618, CVE-2026-109619)'
+              opdata: 'Installed: {ITEM.LASTVALUE2}'
+              url_name: 'PHP security advisory'
+              url: 'https://www.php.net/archive/2026.php#2026-10-21-5'
+              priority: HIGH
+              description: |
+                The installed PHP version is below the upstream fix for its branch ({$PHP2SHELL.FIXED.VERSIONS}). PHP2Shell allows unauthenticated remote code execution against PHP that serves web requests (PHP-FPM, mod_php, php-cgi, FrankenPHP, LiteSpeed), and a working exploit has been demonstrated.
+                
+                Fix: update PHP from your distribution or vendor, then restart PHP-FPM/Apache.
+                
+                If your vendor shipped a backported fix without changing the upstream version, add the exact installed version to {$PHP2SHELL.PATCHED.RELEASES} to clear this problem.
+              manual_close: 'YES'
+              tags:
+                - tag: cve
+                  value: CVE-2026-109618
+                - tag: cve
+                  value: CVE-2026-109619
+                - tag: scope
+                  value: security
+          master_item:
+            key: 'system.sw.packages.get["{$PHP.PKG.MATCHES}"]'
+          lld_macro_paths:
+            - lld_macro: '{#PKG.ARCH}'
+              path: $.arch
+            - lld_macro: '{#PKG.NAME}'
+              path: $.name
+      macros:
+        - macro: '{$PHP.PKG.INTERVAL}'
+          value: 1h
+          description: 'How often to collect the installed package list.'
+        - macro: '{$PHP.PKG.MATCHES}'
+          value: ^php
+        - macro: '{$PHP2SHELL.FIXED.VERSIONS}'
+          value: '8.2.35,8.3.36,8.4.27,8.5.12'
+          description: 'Comma-separated upstream PHP releases that fix CVE-2026-109618 and CVE-2026-109619, one per supported branch. Older branches count as end-of-life.'
+        - macro: '{$PHP2SHELL.PATCHED.RELEASES}'
+          description: 'Comma-separated exact package versions (as shown in the "Installed version" item) that your vendor has confirmed as patched by backport, e.g. 8.2.13-1.el9_6.2. These count as not affected.'
+        - macro: '{$PHP2SHELL.PKG.MATCHES}'
+          value: '^(php[0-9.]*|php[0-9]+-php)-common$'
+          description: 'Regex for the package names checked for PHP2Shell. The default matches the core "-common" package across RHEL, Debian/Ubuntu, Remi SCL and Alpine naming.'
+      valuemaps:
+        - uuid: 28375366c5294ca4a31d3077ed1f7886
+          name: 'PHP2Shell exposure'
+          mappings:
+            - value: '0'
+              newvalue: 'Not affected'
+            - value: '1'
+              newvalue: Vulnerable
+            - value: '2'
+              newvalue: 'End-of-life branch (no upstream fix)'
+            - value: '3'
+              newvalue: Unknown
